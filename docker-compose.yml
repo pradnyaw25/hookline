@@ -1,0 +1,37 @@
+# Needs Docker Desktop or OrbStack. Not needed until stage 2.
+# Alternative without containers: `brew install postgresql@17` and create the hookline role/db.
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: hookline
+      POSTGRES_PASSWORD: hookline
+      POSTGRES_DB: hookline
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hookline"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  # Uncomment as the stages call for them.
+  #
+  # minio:          # stage 12, claim-check payloads
+  #   image: minio/minio
+  #   command: server /data --console-address ":9001"
+  #   environment: { MINIO_ROOT_USER: hookline, MINIO_ROOT_PASSWORD: hookline123 }
+  #   ports: ["9000:9000", "9001:9001"]
+  #
+  # redis:          # stage 13, broker candidate
+  #   image: redis:7
+  #   ports: ["6379:6379"]
+  #
+  # toxiproxy:      # stage 15, partitions and latency injection
+  #   image: ghcr.io/shopify/toxiproxy
+  #   ports: ["8474:8474", "15432:15432", "19000:19000"]
+
+volumes:
+  pgdata:
