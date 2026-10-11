@@ -1,33 +1,25 @@
 """hookline — the service. This file is yours.
 
-Stage 1: ``POST /apps/{id}/events`` records the event, returns 202, and delivers to every
-endpoint of the app in a background task inside this process. No retries, no database;
-a restart loses whatever has not been delivered yet (ADR-0001, fixed at stage 2).
+Stage 2: ``POST /apps/{id}/events`` writes the event and one delivery row per endpoint in a
+single transaction, then returns 202. A separate worker process (``hookline.worker``) polls
+the ``deliveries`` table and sends. The API never talks to a subscriber.
 
-Spec: docs/stages/01-synchronous-delivery.md
+Spec: docs/stages/02-postgres-queue.md
 Why 202: docs/adr/0001-decouple-ingest-from-delivery.md
 """
 
 from __future__ import annotations
 
-import asyncio
-import time
 from contextlib import asynccontextmanager
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
-import httpx
 from fastapi import FastAPI, HTTPException
+from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel
-from pydantic_settings import BaseSettings
 
-
-class Settings(BaseSettings):
-    # How long we wait for a subscriber to answer. Stage 1 waits as long as it takes.
-    delivery_timeout_s: float = 60.0
-
-
-settings = Settings()
+from hookline import db
 
 # ---- models ------------------------------------------------------------------------------
 
@@ -37,7 +29,7 @@ class AppIn(BaseModel):
 
 
 class AppOut(BaseModel):
-    id: str
+    id: UUID
     name: str
 
 
@@ -46,7 +38,7 @@ class EndpointIn(BaseModel):
 
 
 class EndpointOut(BaseModel):
-    id: str
+    id: UUID
     url: str
 
 
@@ -55,34 +47,26 @@ class EventIn(BaseModel):
     payload: dict[str, Any]
 
 
-class DeliveryResult(BaseModel):
-    endpoint_id: str
-    url: str
-    ok: bool
-    status: int | None = None
-    error: str | None = None
-    elapsed_ms: int
-
-
 class EventAccepted(BaseModel):
-    id: str
+    id: UUID
     status: str = "accepted"
 
 
-class EventRecord(BaseModel):
-    id: str
-    app_id: str
+class DeliveryOut(BaseModel):
+    id: int
+    endpoint_id: UUID
+    url: str
+    status: str
+    attempts: int
+    last_status: int | None
+    last_error: str | None
+
+
+class EventOut(BaseModel):
+    id: UUID
+    app_id: UUID
     type: str
-    status: str  # accepted | delivering | done
-    deliveries: list[DeliveryResult] = []
-
-
-# ---- in-memory storage (goes away at stage 2) -------------------------------------------
-
-apps: dict[str, dict[str, Any]] = {}
-endpoints: dict[str, list[dict[str, Any]]] = {}  # app_id -> [{"id", "url"}]
-events: dict[str, EventRecord] = {}  # event_id -> record, filled in by the background task
-background: set[asyncio.Task[None]] = set()  # keep references so tasks are not collected
+    deliveries: list[DeliveryOut]
 
 
 # ---- app ---------------------------------------------------------------------------------
@@ -90,14 +74,19 @@ background: set[asyncio.Task[None]] = set()  # keep references so tasks are not 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.http = httpx.AsyncClient(timeout=settings.delivery_timeout_s)
+    app.state.pool = db.make_pool()
+    await app.state.pool.open()
     try:
         yield
     finally:
-        await app.state.http.aclose()
+        await app.state.pool.close()
 
 
 app = FastAPI(title="hookline", lifespan=lifespan)
+
+
+def pool() -> AsyncConnectionPool:
+    return app.state.pool
 
 
 @app.get("/health")
@@ -107,76 +96,60 @@ async def health() -> dict[str, str]:
 
 @app.post("/apps", response_model=AppOut)
 async def create_app(body: AppIn) -> AppOut:
-    app_id = str(uuid4())
-    apps[app_id] = {"id": app_id, "name": body.name}
-    endpoints[app_id] = []
+    app_id = uuid4()
+    async with pool().connection() as conn:
+        await conn.execute("INSERT INTO apps (id, name) VALUES (%s, %s)", (app_id, body.name))
     return AppOut(id=app_id, name=body.name)
 
 
 @app.post("/apps/{app_id}/endpoints", response_model=EndpointOut)
-async def create_endpoint(app_id: str, body: EndpointIn) -> EndpointOut:
-    if app_id not in apps:
-        raise HTTPException(404, "app not found")
-    ep = {"id": str(uuid4()), "url": body.url}
-    endpoints[app_id].append(ep)
-    return EndpointOut(**ep)
-
-
-async def deliver(
-    http: httpx.AsyncClient, event_id: str, event_type: str, ep: dict[str, Any], body: dict
-) -> DeliveryResult:
-    headers = {
-        "Webhook-Id": event_id,
-        "Webhook-Timestamp": str(int(time.time())),
-        "X-Hookline-Event-Type": event_type,
-    }
-    t0 = time.perf_counter()
-    try:
-        r = await http.post(ep["url"], json=body, headers=headers)
-        return DeliveryResult(
-            endpoint_id=ep["id"],
-            url=ep["url"],
-            ok=r.is_success,
-            status=r.status_code,
-            elapsed_ms=int((time.perf_counter() - t0) * 1000),
+async def create_endpoint(app_id: UUID, body: EndpointIn) -> EndpointOut:
+    ep_id = uuid4()
+    async with pool().connection() as conn:
+        if not await (await conn.execute("SELECT 1 FROM apps WHERE id = %s", (app_id,))).fetchone():
+            raise HTTPException(404, "app not found")
+        await conn.execute(
+            "INSERT INTO endpoints (id, app_id, url) VALUES (%s, %s, %s)", (ep_id, app_id, body.url)
         )
-    except httpx.HTTPError as e:
-        return DeliveryResult(
-            endpoint_id=ep["id"],
-            url=ep["url"],
-            ok=False,
-            error=f"{type(e).__name__}: {e}",
-            elapsed_ms=int((time.perf_counter() - t0) * 1000),
-        )
-
-
-async def deliver_all(event_id: str, payload: dict[str, Any]) -> None:
-    rec = events[event_id]
-    rec.status = "delivering"
-    http: httpx.AsyncClient = app.state.http
-    results = await asyncio.gather(
-        *(deliver(http, event_id, rec.type, ep, payload) for ep in endpoints[rec.app_id])
-    )
-    rec.deliveries = list(results)
-    rec.status = "done"
+    return EndpointOut(id=ep_id, url=body.url)
 
 
 @app.post("/apps/{app_id}/events", response_model=EventAccepted, status_code=202)
-async def create_event(app_id: str, body: EventIn) -> EventAccepted:
-    """Accept responsibility for the event and return. Delivery happens after the response."""
-    if app_id not in apps:
-        raise HTTPException(404, "app not found")
-    event_id = str(uuid4())
-    events[event_id] = EventRecord(id=event_id, app_id=app_id, type=body.type, status="accepted")
-    task = asyncio.create_task(deliver_all(event_id, body.payload))
-    background.add(task)
-    task.add_done_callback(background.discard)
+async def create_event(app_id: UUID, body: EventIn) -> EventAccepted:
+    """Accept responsibility: the event and its delivery rows commit together, then 202."""
+    event_id = uuid4()
+    async with pool().connection() as conn:  # one transaction; commits on exit
+        if not await (await conn.execute("SELECT 1 FROM apps WHERE id = %s", (app_id,))).fetchone():
+            raise HTTPException(404, "app not found")
+        await conn.execute(
+            "INSERT INTO events (id, app_id, type, payload) VALUES (%s, %s, %s, %s)",
+            (event_id, app_id, body.type, Jsonb(body.payload)),
+        )
+        await conn.execute(
+            "INSERT INTO deliveries (event_id, endpoint_id)"
+            " SELECT %s, id FROM endpoints WHERE app_id = %s ORDER BY created_at",
+            (event_id, app_id),
+        )
     return EventAccepted(id=event_id)
 
 
-@app.get("/apps/{app_id}/events/{event_id}", response_model=EventRecord)
-async def get_event(app_id: str, event_id: str) -> EventRecord:
-    rec = events.get(event_id)
-    if rec is None or rec.app_id != app_id:
-        raise HTTPException(404, "event not found")
-    return rec
+@app.get("/apps/{app_id}/events/{event_id}", response_model=EventOut)
+async def get_event(app_id: UUID, event_id: UUID) -> EventOut:
+    async with pool().connection() as conn:
+        ev = await (
+            await conn.execute(
+                "SELECT id, app_id, type FROM events WHERE id = %s AND app_id = %s",
+                (event_id, app_id),
+            )
+        ).fetchone()
+        if ev is None:
+            raise HTTPException(404, "event not found")
+        rows = await (
+            await conn.execute(
+                "SELECT d.id, d.endpoint_id, e.url, d.status, d.attempts, d.last_status,"
+                " d.last_error FROM deliveries d JOIN endpoints e ON e.id = d.endpoint_id"
+                " WHERE d.event_id = %s ORDER BY d.id",
+                (event_id,),
+            )
+        ).fetchall()
+    return EventOut(**ev, deliveries=[DeliveryOut(**r) for r in rows])
