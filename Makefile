@@ -2,7 +2,7 @@ PY := .venv/bin/python
 PORT_API ?= 8000
 PORT_RECEIVER ?= 9000
 
-.PHONY: venv api receiver worker load test lint db db-down db-local db-local-down db-migrate psql
+.PHONY: venv api receiver load test lint db db-down
 
 venv:                      ## create .venv and install everything
 	python3 -m venv .venv
@@ -11,9 +11,6 @@ venv:                      ## create .venv and install everything
 
 api:                       ## run the service (your code) with reload
 	$(PY) -m uvicorn hookline.main:app --reload --port $(PORT_API)
-
-worker:                    ## run one delivery worker (stage 2+); run it twice for two workers
-	$(PY) -m hookline.worker
 
 receiver:                  ## run the flaky receiver
 	$(PY) -m uvicorn tools.receiver.app:app --port $(PORT_RECEIVER)
@@ -32,23 +29,3 @@ db:                        ## stage 2+: start postgres
 
 db-down:
 	docker compose down
-
-PG := /opt/homebrew/opt/postgresql@17/bin
-PGDATA := .pgdata
-export LC_ALL := C   # macOS: without it the postmaster "became multithreaded during startup"
-
-db-local:                  ## stage 2+: start postgres from `brew install postgresql@17`, data in .pgdata/
-	@test -d $(PGDATA) || ( $(PG)/initdb -U hookline --auth=trust $(PGDATA) >/dev/null \
-		&& $(PG)/pg_ctl -D $(PGDATA) -l $(PGDATA)/log -o "-p 5432" start -w -s \
-		&& $(PG)/createdb -U hookline hookline \
-		&& $(PG)/pg_ctl -D $(PGDATA) stop -s )
-	$(PG)/pg_ctl -D $(PGDATA) -l $(PGDATA)/log -o "-p 5432" start -w -s
-
-db-local-down:
-	$(PG)/pg_ctl -D $(PGDATA) stop -s
-
-db-migrate:                ## apply src/hookline/migrations/*.sql
-	$(PY) -m hookline.db migrate
-
-psql:
-	$(PG)/psql -U hookline hookline

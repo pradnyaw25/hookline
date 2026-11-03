@@ -24,29 +24,22 @@ tests/             tests for the tooling; add your own for the service
 ## Setup
 
 Requires Python 3.12+. Postgres (stage 2 onward) via Docker Desktop / OrbStack with the included
-`docker-compose.yml` (`make db`), or `brew install postgresql@17` and `make db-local`, which keeps
-its data in `.pgdata/`. Then `make db-migrate`. Tests use a `hookline_test` database on the same
-server and skip the service tests if it is unreachable.
+`docker-compose.yml`, or a local `brew install postgresql@17`.
 
 ```bash
 make venv
-make db-local && make db-migrate
 make test
 ```
 
 ## Running a stage
 
-Four terminals from stage 2 on:
+Three terminals:
 
 ```bash
 make receiver     # the target, on :9000
 make api          # your service, on :8000
-make worker       # a delivery worker; run it again in a fifth terminal for two
 make load ARGS="--events 200 --concurrency 20"
 ```
-
-`make psql` opens the database; `select status, count(*) from deliveries group by 1` is the
-view the load script does not have.
 
 Shape the receiver's behavior with its control API, for example a 30-second stall:
 

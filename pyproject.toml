@@ -15,7 +15,7 @@ dependencies = [
     "pydantic-settings>=2.3",
     # Arrive at stage 2. Installed now so the environment doesn't change mid-course.
     "sqlalchemy[asyncio]>=2.0.30",
-    "psycopg[binary,pool]>=3.2",
+    "psycopg[binary]>=3.2",
     "alembic>=1.13",
 ]
 
