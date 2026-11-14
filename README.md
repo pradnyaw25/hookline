@@ -7,7 +7,8 @@ retries on a backoff schedule, dead-letters what never succeeds, and keeps a log
 
 The product is secondary. Each stage builds the obvious version of something, breaks it under a
 reproducible load, and only then introduces the pattern that fixes it. The record of those
-decisions lives in `docs/adr/`. The full course is in [docs/ROADMAP.md](docs/ROADMAP.md).
+decisions lives in `docs/adr/`. The course is six stages, in [docs/ROADMAP.md](docs/ROADMAP.md);
+the original long version is kept in [docs/ROADMAP-full.md](docs/ROADMAP-full.md).
 
 ## Layout
 

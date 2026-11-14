@@ -1,72 +1,60 @@
 # Roadmap
 
-Every stage has the same shape: **build** the obvious version, **break** it with the load script
-and the flaky receiver, write an ADR, then fix it. The detailed spec for a stage is written in
-`docs/stages/` when that stage is reached; this file is the map.
+The short course: six stages, one piece of infrastructure (Postgres), everything written by
+hand. The original 25-stage course is kept in [ROADMAP-full.md](ROADMAP-full.md) for later.
 
-Stages 1–9 are the standard patterns. 10–15 add scale and coordination. 16–25 go deep on
-concurrency at three layers: inside one process, across processes on one machine, and across
-machines through the database.
+Every stage has the same shape: **build** the obvious version, **break** it with the load
+script and the flaky receiver, write an ADR, then fix it. The detailed spec for a stage is
+written in `docs/stages/` when that stage is reached; this file is the map.
 
-## Part 1 — the standard patterns
+You can stop after any stage and still have a working service.
 
 | # | Build | Break | Lesson |
 |---|---|---|---|
 | 1 | Synchronous delivery: event endpoint calls subscribers inline | One endpoint 30s slow | Decouple ingest from delivery; what 202 means |
-| 2 | Deliveries as Postgres rows, a worker polls them | Two workers double-send; kill a worker mid-delivery, row stuck forever | Concurrent consumers, `FOR UPDATE SKIP LOCKED`, leases and reclaiming abandoned work |
-| 3 | Lease reclaim | Worker sends, then crashes before marking done | At-least-once; receiver idempotency; event id header; transactional outbox |
-| 4 | Naive retry: fail, wait 1s, retry | Receiver down 60s with 1,000 pending | Exponential backoff + jitter, thundering herd, capped schedule, dead-letter |
-| 5 | Shared worker pool | One slow subscriber; healthy ones' latency climbs | Head-of-line blocking, per-endpoint concurrency, bulkheads, circuit breaker / auto-disable |
-| 6 | No ingest limits | Push faster than workers deliver | Back-pressure: where to apply it; queue depth as the key metric; graceful degradation |
-| 7 | Add workers | Throughput stops improving | Find the real bottleneck (polling, connections); polling vs `LISTEN/NOTIFY`; honest broker evaluation |
-| 8 | Logs, metrics, delivery-log endpoint | Re-run stage 5 blind, then with metrics | What you needed to see and couldn't |
-| 9 | Signing (Standard Webhooks), secret rotation, SSRF guard, body caps | Point an endpoint at `localhost:5432` | What makes the service safe to point at |
+| 2 | Deliveries as Postgres rows, a worker polls them | Two workers double-send; kill a worker mid-delivery, row stuck forever | Concurrent consumers, `FOR UPDATE SKIP LOCKED`, leases; reclaiming means re-sending, so delivery is at-least-once |
+| 3 | Naive retry: fail, wait 1s, retry | Receiver down 60s with 200 pending; count the attempts | A `next_attempt_at` column as the delay queue, exponential backoff + jitter, attempt cap, dead-letter |
+| 4 | Live delivery feed over **SSE**: each connected client polls the attempts table once a second | 30 feeds open during a load run: queries per second, pool wait, feed lag | Polling vs push; `LISTEN/NOTIFY` as the doorbell and the table as the log; resuming with `Last-Event-ID` because a notification can be missed |
+| 5 | Dashboard over **WebSocket**: one HTML page that filters the feed, pauses an endpoint, replays a dead-lettered delivery | A client that stops reading while the load script runs | Back-pressure on push connections; bounded per-client queues and a drop policy; ping/pong and dead connections; SSE vs WebSocket |
+| 6 | Nothing new; watch the dashboard | One endpoint stalls; healthy endpoints' latency climbs | Head-of-line blocking; per-endpoint concurrency limits in the claim query; a circuit breaker that every worker agrees on |
 
-## Part 2 — scale and coordination
+## Why each piece is here
 
-| # | Build | Break | Lesson |
-|---|---|---|---|
-| 10 | Optional ordering key per event | One failed delivery must block everything behind it on that key | Partitions; ordering vs retries conflict; why ordering is opt-in |
-| 11 | Multi-tenant ingest | Tenant A pushes 1M events; tenant B's 10 wait | Fair scheduling, weighted round-robin in the claim query, token-bucket limits, per-tenant quotas |
-| 12 | Nothing; just run for hours | Tens of millions of rows; p99 climbs with no code change | Time partitioning, archival, index bloat, queue vs log; claim-check for large payloads (MinIO) |
-| 13 | Move dispatch to Redis Streams or Kafka, Postgres stays system of record | Insert event, publish, crash in between | Dual-write problem; outbox done properly (relay or CDC/Debezium); consumer groups, offsets, rebalancing. **Decision point:** if Postgres is still fine at measured load, say so and stop here |
-| 14 | Two API instances, two workers, Postgres replica | Lease reclaim and outbox relay run on two nodes at once | Leader election (advisory lock / etcd), split brain, fencing tokens |
-| 15 | Toxiproxy between workers and both Postgres and the receiver | Latency, loss, full partitions under load | What CAP means here; timeouts vs retries at every hop; which failures the system handles vs lies about |
+Each technology has to solve a problem the previous stage actually has. If a stage feels like
+it is using one for its own sake, that is worth an ADR.
 
-## Part 3 — concurrency, three layers deep
+- **Postgres** arrives at stage 2 because a 202 is a promise, and a promise has to survive a
+  restart. The same table then serves as the queue (2), the retry schedule (3), the log the
+  feed reads from (4), the place "paused" and "dead" live so the dashboard and the worker see
+  the same thing (5), and the counters several workers must agree on (6). One store, one
+  source of truth, transactions between all of it.
+- **SSE** arrives at stage 4 because the feed is one-way and the browser's `EventSource`
+  reconnects and resumes by itself. Write the `text/event-stream` response by hand; it is
+  about fifteen lines and the framing (`id:`, `event:`, `data:`, blank line) is the lesson.
+- **WebSocket** arrives at stage 5 because the browser starts talking back. If a feature only
+  needs server-to-browser, it stays on SSE; deciding which is which is part of the stage.
 
-### Inside one worker process
+## Why not Redis
 
-| # | Build | Break | Lesson |
-|---|---|---|---|
-| 16 | asyncio worker | Plant a blocking call (sync DNS, HMAC over 5MB, sync DB call); p99 spikes for *every* endpoint | Blocking the loop; slow-callback debug mode; thread/process pools |
-| 17 | `gather` over everything claimed | Claim 5,000 rows → 5,000 sockets, fd exhaustion, throttled | Semaphores; per-endpoint limits as second layer; httpx pool sizing |
-| 18 | Plain worker loop | SIGTERM with 200 in flight: dropped, some already sent → resent later | Structured concurrency (TaskGroup), draining, drain timeouts, cancellation at every external await |
-| 19 | In-process circuit breaker dict | Read, await, write — another task interleaves | asyncio still has races; critical sections; when a lock is right |
+Considered, and left out on purpose. Everything Redis would do here, Postgres already does
+with data the service has to keep anyway: the queue is a table, the delay queue is a
+timestamp column, and `LISTEN/NOTIFY` is the pub/sub. A second store would mean two places
+that must agree, which is the dual-write problem from stage 13 of the full course.
 
-### Across processes on one machine
+The signals that would change this: `NOTIFY` volume showing up in the database's own
+latency, several API instances each holding thousands of feed connections, or a rate limiter
+hot enough that a row per endpoint contends. Measure first; that is stage 13's whole point.
 
-| # | Build | Break | Lesson |
-|---|---|---|---|
-| 20 | Signing in-process | Large payloads; one process pins a core, others idle | GIL; threads vs processes; process pool for CPU work; serialization overhead; free-threaded build |
-| 21 | Per-process connection pool | 20 processes hit Postgres' connection limit; workers hang on checkout | Pools as shared resource; pgbouncer; checkout timeouts |
+## What changed from the full course
 
-### Across machines
+- Stages 1, 2, 4 and 5 of the full course are here as stages 1, 2, 3 and 6. Stage 3's
+  at-least-once lesson is folded into stage 2.
+- A small UI is in scope. The full course excluded one; here it is the reason for stages 4
+  and 5, and the instrument for stage 6.
+- Back-pressure at ingest, signing, multi-tenancy, ordering, partitioning, leader election and
+  the deep concurrency stages are deferred, not dropped.
 
-| # | Build | Break | Lesson |
-|---|---|---|---|
-| 22 | Claim query | 50 workers with/without `SKIP LOCKED`; then optimistic `UPDATE ... WHERE version = N` | Pessimistic vs optimistic concurrency; lock contention; idempotent state transitions in SQL |
-| 23 | Lease expiry | Slow worker's lease expires, second worker claims, first finishes: both delivered | **Fencing tokens.** The most important ten lines of SQL in the project |
-| 24 | Ordering keys (from 10) | "At most one in flight per key, across all workers" | Lock granularity: row lock vs striping vs advisory lock; hot keys |
-| 25 | Timestamps everywhere | One worker's clock two minutes fast | Never compare wall clocks across machines; DB clock as authority; timeout vs deadline |
+## Still out of scope
 
-### Where Part 3 slots in
-
-16–19 right after stage 5. 20–21 after stage 7. 22–25 alongside stage 14.
-The receiver needs no changes; the load script will need to report open sockets and pool wait
-time around stage 17.
-
-## Deliberately out of scope
-
-Multi-region, active-active replication, a real UI, transformations or a filtering DSL, any AI
-feature. They don't teach anything the stages above don't, and they eat the time.
+Multi-region, a frontend framework or build step (one static HTML file is enough), auth on the
+dashboard, any AI feature.
