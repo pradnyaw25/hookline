@@ -2,7 +2,7 @@ PY := .venv/bin/python
 PORT_API ?= 8000
 PORT_RECEIVER ?= 9000
 
-.PHONY: venv api receiver load test lint db db-down
+.PHONY: venv api receiver load test lint fmt db db-down
 
 venv:                      ## create .venv and install everything
 	python3 -m venv .venv
@@ -23,6 +23,9 @@ test:
 
 lint:
 	$(PY) -m ruff check . && $(PY) -m ruff format --check .
+
+fmt:                       ## fix what lint complains about: sort imports, reformat
+	$(PY) -m ruff check --fix . ; $(PY) -m ruff format .
 
 db:                        ## stage 2+: start postgres
 	docker compose up -d postgres

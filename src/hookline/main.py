@@ -7,6 +7,7 @@ The load script and flaky receiver expect the API contract described there.
 from typing import Any
 from uuid import uuid4
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -28,6 +29,27 @@ app = FastAPI(title="hookline")
 
 apps: dict[str, dict[str, str]] = {}
 endpoints: dict[str, list[dict[str, str]]] = {}
+
+
+async def deliver(
+    client: httpx.AsyncClient, endpoint: dict[str, str], event_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    res: dict[str, Any] = {
+        "endpoint_id": endpoint["id"],
+        "event_id": event_id,
+        "url": endpoint["url"],
+        "status": "failed",
+        "status_code": None,
+        "error": None,
+    }
+    try:
+        r = await client.post(endpoint["url"], json=payload, headers={"Webhook-Id": event_id})
+    except httpx.HTTPError as e:
+        res["error"] = f"{type(e).__name__}: {e}"
+        return res
+    res["status"] = "success" if r.is_success else "failed"
+    res["status_code"] = r.status_code
+    return res
 
 
 @app.get("/health")
