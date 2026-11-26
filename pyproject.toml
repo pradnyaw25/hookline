@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "hookline"
 version = "0.0.1"
-description = "An outbound webhook delivery service, built stage by stage to learn system design."
+description = "An outbound webhook delivery service"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",

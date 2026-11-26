@@ -1,6 +1,6 @@
 # hookline
 
-An outbound webhook delivery service, built one stage at a time to learn system design.
+An outbound webhook delivery service.
 
 Producers POST an event. hookline fans it out to every subscribed endpoint, signs each request,
 retries on a backoff schedule, dead-letters what never succeeds, and keeps a log of every attempt.
